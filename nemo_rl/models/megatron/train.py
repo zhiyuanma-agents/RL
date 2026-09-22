@@ -796,8 +796,34 @@ class LogprobsPostProcessor:
 
         def processor_fn_inner(output_tensor):
             if self.use_fused_linear_logprobs:
+                # PTP patch 26: the fused forward returns CP-LOCAL per-token log-probs; gather per sequence and
+                # unpack THD exactly like from_parallel_logits_to_logprobs_packed_sequences does for logits.
                 token_logprobs = output_tensor.to(torch.float32)
-                token_logprobs = token_logprobs[:, : original_seq_length - 1]
+                cp_group = get_context_parallel_group()
+                cp_size = torch.distributed.get_world_size(cp_group) if cp_group is not None else 1
+                if self.cfg["sequence_packing"]["enabled"]:
+                    probs = token_logprobs.squeeze(0)
+                    bsz = int(cu_seqlens_padded.shape[0]) - 1
+                    if cp_size > 1:
+                        full = torch.zeros(probs.shape[0] * cp_size, dtype=probs.dtype, device=probs.device)
+                        for i in range(bsz):
+                            s_i = int(cu_seqlens_padded[i]); e_i = int(cu_seqlens_padded[i + 1])
+                            if e_i > s_i:
+                                full[s_i:e_i] = allgather_cp_sharded_tensor(probs[s_i // cp_size : e_i // cp_size], cp_group, seq_dim=0)
+                        probs = full
+                    out = torch.zeros((bsz, original_seq_length - 1), dtype=probs.dtype, device=probs.device)
+                    for i in range(bsz):
+                        s_i = int(cu_seqlens_padded[i]); e_i = int(cu_seqlens_padded[i + 1])
+                        if e_i - s_i > 0:
+                            seq_probs = probs[s_i : e_i - 1]
+                            n_i = min(int(seq_probs.shape[0]), original_seq_length - 1)
+                            if n_i > 0:
+                                out[i, :n_i] = seq_probs[:n_i]
+                    token_logprobs = out
+                else:
+                    if cp_size > 1:
+                        token_logprobs = allgather_cp_sharded_tensor(token_logprobs, cp_group, seq_dim=1)
+                    token_logprobs = token_logprobs[:, : original_seq_length - 1]
             elif self.cfg["sequence_packing"]["enabled"]:
                 tp_grp = get_tensor_model_parallel_group()
                 tp_rank = get_tensor_model_parallel_rank()

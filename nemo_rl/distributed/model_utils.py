@@ -3042,3 +3042,188 @@ def all_to_all_sq2vp(
     output_tensor = output_flat.reshape(world_size * BS_local, V_local)
 
     return output_tensor
+
+
+# ---- PTP patch 26 (22 Sep 2026): linear CE fusion for Megatron HybridModel (Nemotron Omni / NemotronH) ----
+# The fused path never materializes the [tokens, vocab] logits: the output projection is applied chunk-wise inside
+# ChunkedDistributedHiddenStatesToLogprobs and only the selected-token log-probs survive.  Unlike the GPTModel variant
+# above this one supports THD sequence packing and context parallelism: the caller (the Nemotron Omni wrapper) hands
+# the language model per-sequence pre-rolled next-token targets in the model's own CP-local token layout, and this
+# forward returns CP-LOCAL per-token log-probs [B, S_local]; the NeMo RL consumers gather them across CP per sequence
+# with allgather_cp_sharded_tensor, exactly like the non-fused logits path (same gradient convention, cp_normalize).
+def patch_hybrid_model_forward_for_linear_ce_fusion(*, chunk_size: int) -> None:
+    from megatron.core.models.hybrid.hybrid_model import HybridModel
+
+    if getattr(HybridModel, "_linear_ce_fusion_forward_patched", False):
+        HybridModel._linear_ce_fusion_chunk_size = chunk_size
+        return
+    HybridModel._original_forward_for_linear_ce_fusion = HybridModel.forward
+    HybridModel._linear_ce_fusion_chunk_size = chunk_size
+    HybridModel.forward = _hybrid_forward_with_linear_ce_fusion
+    HybridModel._linear_ce_fusion_forward_patched = True
+
+
+def _hybrid_forward_with_linear_ce_fusion(
+    self,
+    input_ids,
+    position_ids,
+    attention_mask,
+    decoder_input=None,
+    labels=None,
+    inference_context=None,
+    runtime_gather_output=None,
+    *,
+    inference_params=None,
+    loss_mask=None,
+    mtp_input_mask=None,
+    packed_seq_params=None,
+    padding_mask=None,
+    compute_mtp_loss=True,
+    return_logprobs_for_linear_ce_fusion: bool = False,
+):
+    if not return_logprobs_for_linear_ce_fusion:
+        return self._original_forward_for_linear_ce_fusion(
+            input_ids,
+            position_ids,
+            attention_mask,
+            decoder_input=decoder_input,
+            labels=labels,
+            inference_context=inference_context,
+            runtime_gather_output=runtime_gather_output,
+            inference_params=inference_params,
+            loss_mask=loss_mask,
+            mtp_input_mask=mtp_input_mask,
+            packed_seq_params=packed_seq_params,
+            padding_mask=padding_mask,
+            compute_mtp_loss=compute_mtp_loss,
+        )
+
+    import sys as _sys
+
+    hm = _sys.modules["megatron.core.models.hybrid.hybrid_model"]
+    if labels is None:
+        raise ValueError("labels (pre-rolled policy targets) must be provided when linear CE fusion is enabled")
+    inference_context = hm.deprecate_inference_params(inference_context, inference_params)
+    if hm.InferenceMode.is_active() or inference_context is not None:
+        raise NotImplementedError("the fused log-prob forward serves training / log-prob passes only")
+    if getattr(self.config, "use_mup", False):
+        raise NotImplementedError("muP logit scaling is not supported by the fused log-prob path")
+
+    if self.config.fine_grained_activation_offloading:
+        self.preprocess_for_fine_grained_offloading()
+    if self.config.moe_paged_stash:
+        self.preprocess_for_paged_stash()
+
+    # Decoder embedding (the Omni wrapper passes merged media embeddings as decoder_input).
+    if decoder_input is not None:
+        pass
+    elif self.pre_process:
+        decoder_input = self.embedding(input_ids=input_ids, position_ids=position_ids)
+        if self.config.sequence_parallel and not self.embedding.scatter_to_sequence_parallel:
+            decoder_input = hm.tensor_parallel.scatter_to_sequence_parallel_region(
+                decoder_input, group=self.pg_collection.tp
+            )
+    else:
+        decoder_input = None
+
+    rotary_pos_emb = None
+    if self.position_embedding_type == "rope" and not self.config.multi_latent_attention:
+        rotary_seq_len = self.rotary_pos_emb.get_rotary_seq_len(
+            inference_context, self.decoder, decoder_input, self.config, packed_seq_params
+        )
+        rotary_pos_emb = self.rotary_pos_emb(
+            rotary_seq_len,
+            packed_seq=packed_seq_params is not None and packed_seq_params.qkv_format == "thd",
+        )
+    elif self.position_embedding_type == "yarn":
+        rotary_seq_len = self.rotary_pos_emb.get_rotary_seq_len(
+            inference_context, self.decoder, decoder_input, self.config, packed_seq_params
+        )
+        rotary_pos_emb, _ = self.rotary_pos_emb(
+            rotary_seq_len,
+            packed_seq=packed_seq_params is not None and packed_seq_params.qkv_format == "thd",
+        )
+
+    decoder_output = self.decoder(
+        hidden_states=decoder_input,
+        attention_mask=attention_mask,
+        inference_context=inference_context,
+        rotary_pos_emb=rotary_pos_emb,
+        packed_seq_params=packed_seq_params,
+        padding_mask=padding_mask,
+    )
+    if isinstance(decoder_output, tuple):
+        hidden_states, mhc_multistream = decoder_output
+    else:
+        hidden_states, mhc_multistream = decoder_output, None
+
+    output_weight = None
+    if self.share_embeddings_and_output_weights:
+        output_weight = self.shared_embedding_or_output_weight()
+
+    mtp_forward_ran = bool(self.mtp_process and compute_mtp_loss)
+    if mtp_forward_ran:
+        hidden_states = self.mtp(
+            input_ids=input_ids,
+            position_ids=position_ids,
+            hidden_states=hidden_states,
+            mhc_multistream=mhc_multistream,
+            attention_mask=attention_mask,
+            inference_params=inference_params,
+            rotary_pos_emb=rotary_pos_emb,
+            packed_seq_params=packed_seq_params,
+            embedding=self.embedding,
+            mtp_input_mask=mtp_input_mask,
+        )
+
+    if not self.post_process:
+        return hidden_states
+
+    if self.config.mtp_num_layers is not None and self.mtp_process and mtp_forward_ran:
+        # RL convention (labels=None): process_mtp_loss derives the MTP targets from input_ids.  Our `labels` are the
+        # pre-rolled POLICY targets for the fused log-prob head, not SFT labels, so they must not reach the MTP loss.
+        hidden_states = hm.process_mtp_loss(
+            hidden_states=hidden_states,
+            labels=None,
+            loss_mask=loss_mask,
+            output_layer=self.output_layer,
+            output_weight=output_weight,
+            runtime_gather_output=runtime_gather_output,
+            is_training=self.training,
+            compute_language_model_loss=self.compute_language_model_loss,
+            config=self.config,
+            cp_group=self.pg_collection.cp,
+            tp_group=self.tp_group,
+            packed_seq_params=packed_seq_params,
+            scale_logits_fn=None,
+            input_ids=input_ids,
+            mtp_input_mask=mtp_input_mask,
+            metric_avg_group=(
+                getattr(self.pg_collection, "dp_cp_gtp_remat", None) or self.pg_collection.dp_cp
+            ),
+        )
+
+    tp_group = self.tp_group
+    tp_rank = torch.distributed.get_rank(tp_group)
+    tp_size = torch.distributed.get_world_size(tp_group)
+    output_weight_layer = output_weight if output_weight is not None else self.output_layer.weight
+    local_vocab = output_weight_layer.shape[0]
+    vocab_start_index = tp_rank * local_vocab
+    vocab_end_index = (tp_rank + 1) * local_vocab
+    if labels.dim() != 2 or labels.shape[0] != hidden_states.shape[1] or labels.shape[1] != hidden_states.shape[0]:
+        raise ValueError(
+            f"fused log-probs: labels {tuple(labels.shape)} must be [B, S_local] matching hidden states "
+            f"{tuple(hidden_states.shape)} = [S_local, B, H]"
+        )
+    logprobs = ChunkedDistributedHiddenStatesToLogprobs.apply(  # type: ignore
+        hidden_states,
+        labels,
+        output_weight_layer,
+        vocab_start_index,
+        vocab_end_index,
+        int(self._linear_ce_fusion_chunk_size),
+        tp_group,
+        not torch.is_grad_enabled(),
+    )
+    # CP-LOCAL [B, S_local] fp32: position t holds log p(target[t]) where target is the caller's pre-rolled next token.
+    return logprobs.contiguous()

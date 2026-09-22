@@ -807,11 +807,8 @@ class MegatronPolicyWorkerImpl(
             # same full THD row as input_ids and leaves it unsharded, so the
             # model's own post-embedding CP slice applies to both alike. See the
             # mtp_loss_mask branch in nemo_rl.models.megatron.data.
-            if self.cfg["megatron_cfg"].get("use_fused_linear_logprobs", False):
-                raise NotImplementedError(
-                    "Nemotron Omni caller-packed THD inputs do not support "
-                    "use_fused_linear_logprobs=true."
-                )
+            # PTP patch 26: use_fused_linear_logprobs is supported for caller-packed THD inputs (per-sequence
+            # pre-rolled targets + CP-local fused log-probs, see model_utils._hybrid_forward_with_linear_ce_fusion).
             virtual_pipeline_size = self.cfg["megatron_cfg"].get(
                 "virtual_pipeline_model_parallel_size"
             )

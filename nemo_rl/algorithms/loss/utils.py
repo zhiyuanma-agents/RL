@@ -424,6 +424,10 @@ def prepare_loss_input(
             and loss_fn.use_fused_linear_logprobs
         ):
             logprobs = logits
+            # PTP patch 26: CP-local per-token log-probs from the fused forward -> gather across CP first.
+            if context_parallel_group is not None and torch.distributed.get_world_size(context_parallel_group) > 1:
+                from nemo_rl.distributed.model_utils import allgather_cp_sharded_tensor as _ptp_cp_gather
+                logprobs = _ptp_cp_gather(logprobs, context_parallel_group, seq_dim=1)
             logprobs = logprobs.to(torch.float32)
             logprobs = logprobs[:, : data["input_ids"].shape[1] - 1]
         else:

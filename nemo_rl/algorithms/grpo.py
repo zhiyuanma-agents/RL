@@ -751,12 +751,8 @@ def setup(
         # Sequence packing is not yet validated with the fused path: the fused
         # forward rolls labels over the whole (packed) sequence and would mix
         # tokens across packed-sequence boundaries.
-        assert not policy_config["sequence_packing"]["enabled"], (
-            "Linear CE fusion loss is not supported with sequence packing for GRPO. "
-            "The fused path has not been validated with cu_seqlens-based logprob "
-            "aggregation. Set policy.megatron_cfg.use_fused_linear_logprobs=false "
-            "or policy.sequence_packing.enabled=false."
-        )
+        # PTP patch 26: sequence packing IS supported with the fused path -- targets are rolled per packed
+        # sequence (never across boundaries) and the consumers slice/gather per sequence.
         # The fused forward gathers the logprob of the realized token from the raw
         # (unfiltered) logits, so top-k/top-p training-time filtering cannot be
         # applied. This also keeps prev/reference logprobs (computed via the fused

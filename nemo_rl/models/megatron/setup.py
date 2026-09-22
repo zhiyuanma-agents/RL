@@ -76,7 +76,10 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import get_model_config
 from transformers import PreTrainedTokenizerBase
 
-from nemo_rl.distributed.model_utils import patch_gpt_model_forward_for_linear_ce_fusion
+from nemo_rl.distributed.model_utils import (
+    patch_gpt_model_forward_for_linear_ce_fusion,
+    patch_hybrid_model_forward_for_linear_ce_fusion,
+)
 from nemo_rl.models.generation.vllm.config import (
     VllmConfig,
     parse_nvfp4_pertoken_rollout,
@@ -1216,9 +1219,8 @@ def _apply_parallelism_config(model_cfg: Any, config: PolicyConfig) -> None:
         assert config["sequence_packing"]["enabled"], (
             "Sequence Packing must be enabled to use Context Parallelism with MCore."
         )
-        assert not config["megatron_cfg"].get("use_fused_linear_logprobs", False), (
-            "Context Parallelism is not supported with linear CE fusion loss, please set use_fused_linear_logprobs to false"
-        )
+        # PTP patch 26: the HybridModel fused path supports context parallelism (per-sequence pre-rolled targets,
+        # CP-local log-probs gathered per sequence by the consumers); the GPTModel variant still asserts CP=1 itself.
 
 
 def _apply_multimodal_config(model_cfg: Any, config: PolicyConfig) -> None:
@@ -1909,6 +1911,8 @@ def _create_checkpoint_config(
     # — no call-site default — so a config that omits the block keeps Bridge's
     # default (synchronous save).
     _optional_ckpt_fields = (
+        "also_save_hf_checkpoint",   # PTP patch 27: PEFT adapter sidecar (adapter_model.safetensors) next to each Megatron LoRA checkpoint
+        "hf_source_path",
         "async_save",
         "ckpt_assume_constant_structure",
         "ckpt_fully_parallel_save_process_group",
@@ -2520,6 +2524,9 @@ def setup_model_and_optimizer(
     setattr(megatron_cfg.model, "_pg_collection", pg_collection)
     if policy_cfg["megatron_cfg"].get("use_fused_linear_logprobs", False):
         patch_gpt_model_forward_for_linear_ce_fusion(
+            chunk_size=policy_cfg["megatron_cfg"]["fused_linear_logprobs_chunk_size"]
+        )
+        patch_hybrid_model_forward_for_linear_ce_fusion(
             chunk_size=policy_cfg["megatron_cfg"]["fused_linear_logprobs_chunk_size"]
         )
     model = get_model(
